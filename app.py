@@ -18,16 +18,7 @@ from requests.adapters import HTTPAdapter, Retry
 # ============================ Motores Preconfigurados ============================
 
 DEFAULT_WORKERS = (
-    "https://motor-liv1.onrender.com, "
-    "https://motor-liv2.onrender.com, "
-    "https://motor-liv3.onrender.com, "
-    "https://motor-liv4.onrender.com, "
-    "https://motor-liv5.onrender.com, "
-    "https://motor-liv6.onrender.com, "
-    "https://motor-liv7.onrender.com, "
-    "https://motor-liv8.onrender.com, "
-    "https://motor-liv9.onrender.com, "
-    "https://motor-liv10.onrender.com"
+    "https://motor-liv1.onrender.com"
 )
 
 # ============================ Catálogo ============================
