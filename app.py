@@ -1,4 +1,4 @@
-# app.py – V8.7 Maestro Distribuido (E-commerce Minimalist UI + 10 Motores)
+# app.py – V8.7 Maestro Distribuido Definitivo (10 Motores en Oleadas + UI Completa V8.6)
 import os
 import re
 import time
@@ -130,7 +130,7 @@ CATALOGO_LIVERPOOL = {
 }
 
 BASE_HOME = "https://www.liverpool.com.mx"
-WORKER_TIMEOUT = 120
+WORKER_TIMEOUT = 120  # Amplio por si los motores gratuitos de Render están despertando
 NOTIFY_SOUND = os.environ.get("CUSTOM_NOTIFY_SOUND", "notify.mp3")
 
 def _coerce_nonempty_str(x: t.Any) -> str: return ("" if pd.isna(x) else str(x)).strip()
@@ -175,9 +175,10 @@ def parse_grouped_skus(text: str) -> tuple[list[tuple[str, str]], dict[str, list
                     current_category = re.sub(r'\s+', ' ', clean_text)
     return out, duplicates
 
-# ============================ Extractor de Categorías (Maestro) ============================
+# ====================== Extractor Ligero de Categorías ======================
 
 def extraer_skus_de_categoria_maestro(url: str, limit: int = 50) -> list[str]:
+    """Extrae los SKUs destacados directamente desde el Maestro antes de repartirlos a los 10 motores"""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -185,7 +186,8 @@ def extraer_skus_de_categoria_maestro(url: str, limit: int = 50) -> list[str]:
             "Referer": BASE_HOME,
         }
         r = requests.get(url, headers=headers, timeout=15)
-        if r.status_code != 200 or not r.text: return []
+        if r.status_code != 200 or not r.text:
+            return []
         html = r.text
         skus = []
         soup = BeautifulSoup(html, "html.parser")
@@ -197,8 +199,10 @@ def extraer_skus_de_categoria_maestro(url: str, limit: int = 50) -> list[str]:
                 records = data.get("props", {}).get("pageProps", {}).get("initialState", {}).get("plp", {}).get("plpState", {}).get("records", [])
                 for rec in records:
                     sku = rec.get("productId")
-                    if sku and sku not in skus: skus.append(sku)
-                if skus: return skus[:limit]
+                    if sku and sku not in skus:
+                        skus.append(sku)
+                if skus:
+                    return skus[:limit]
             except: pass
             
         main_content = soup.find("main") or soup
@@ -213,27 +217,32 @@ def extraer_skus_de_categoria_maestro(url: str, limit: int = 50) -> list[str]:
     except Exception:
         return []
 
-# ====================== Orquestador Distribuido ======================
+# ====================== Orquestador Distribuido en Tiempo Real ======================
 
-def consultar_worker(worker_url: str, item_sku: tuple[str, str]) -> dict:
+def consultar_worker(worker_url: str, item_sku: tuple[str, str], usar_google: bool) -> dict:
+    """Envía 1 producto al motor asignado y retorna su resultado"""
     url = worker_url.strip().rstrip("/") + "/procesar_lote"
-    payload = {"skus": [list(item_sku)], "usar_google": True}
+    payload = {"skus": [list(item_sku)], "usar_google": usar_google}
     for intento in range(2):
         try:
             resp = requests.post(url, json=payload, timeout=WORKER_TIMEOUT)
-            if resp.status_code == 200: return resp.json()
-        except Exception:
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            print(f"Intento {intento+1} fallido en {worker_url}: {e}")
             time.sleep(1)
+    # Si el motor falló tras reintentar, marcar como offline para no colgar el proceso
     grupo, sku = item_sku
     return {"valid_records": [], "offline": {grupo: [sku]}}
 
 def core_engine_distribuido(parsed_skus, duplicates_dict, workers_str, delay_val, usar_google_val, show_url_val, show_name_val, show_strategy_val, prefix="ENTREGABLE"):
     total = len(parsed_skus)
     workers = [w.strip() for w in workers_str.split(",") if w.strip()]
-    if not workers: raise gr.Error("Configura al menos una URL de Motor válida.")
+    if not workers:
+        raise gr.Error("Configura al menos una URL de Motor válida.")
     
     num_workers = len(workers)
-    initial_spinner = generate_inline_spinner(0, 0, total, f"Conectando con {num_workers} motores...")
+    initial_spinner = generate_inline_spinner(0, 0, total, f"Conectando con {num_workers} motores en paralelo...")
     
     yield (
         gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), 
@@ -245,15 +254,20 @@ def core_engine_distribuido(parsed_skus, duplicates_dict, workers_str, delay_val
     t0 = time.monotonic()
     done = 0
 
+    # Procesamos en oleadas del tamaño del número de motores (ej. de 10 en 10)
+    # Así el Motor 1 hace el 1, el Motor 2 el 2... y al terminar la oleada se muestran en estricto orden
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
         for wave_start in range(0, total, num_workers):
             wave_items = parsed_skus[wave_start:wave_start + num_workers]
+            
+            # Asignar cada producto de la oleada a su motor correspondiente (1->Motor1, 2->Motor2...)
             futures_in_order = [
-                executor.submit(consultar_worker, workers[idx], item)
+                executor.submit(consultar_worker, workers[idx], item, usar_google_val)
                 for idx, item in enumerate(wave_items)
             ]
             
-            for future in futures_in_order:
+            # Recolectar exactamente en el orden de la lista original
+            for idx, future in enumerate(futures_in_order):
                 res = future.result()
                 batch_valid = res.get("valid_records", [])
                 batch_offline = res.get("offline", {})
@@ -263,12 +277,15 @@ def core_engine_distribuido(parsed_skus, duplicates_dict, workers_str, delay_val
                     valid_records.append(rec)
                     
                 for grupo, skus_list in batch_offline.items():
-                    if grupo not in offline_dict: offline_dict[grupo] = []
+                    if grupo not in offline_dict:
+                        offline_dict[grupo] = []
                     for s in skus_list:
-                        if s not in offline_dict[grupo]: offline_dict[grupo].append(s)
+                        if s not in offline_dict[grupo]:
+                            offline_dict[grupo].append(s)
 
             done += len(wave_items)
-            if delay_val > 0: time.sleep(delay_val)
+            if delay_val > 0:
+                time.sleep(delay_val)
 
             elapsed = max(1e-6, time.monotonic() - t0)
             rate = done / elapsed
@@ -290,15 +307,19 @@ def core_engine_distribuido(parsed_skus, duplicates_dict, workers_str, delay_val
                 gr.update(value=None, visible=False)
             )
 
+    # FINALIZACIÓN
     final_df = pd.DataFrame(valid_records)
     feed_path = _write_csvs(final_df, f"{prefix}_V8_7")
     
     success_card = f"""
-    <div style="background: linear-gradient(to right, #ecfdf5, #d1fae5); border-left: 6px solid #10b981; padding: 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom: 20px;">
-        <h3 style="margin: 0 0 10px 0; color: #064e3b; font-size: 18px; font-weight: bold;">🎉 ¡Procesamiento Exitoso ({num_workers} Motores)!</h3>
-        <div style="display: flex; gap: 15px; font-size: 14px; flex-wrap: wrap; color: #064e3b;">
-            <div><strong>SKUs Validados:</strong> {len(valid_records)}</div>
-            <div><strong>Tiempo Total:</strong> {fmt_duration(time.monotonic() - t0)}</div>
+    <div style="background: linear-gradient(to right, #ecfdf5, #d1fae5); border-left: 6px solid #10b981; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px;">
+        <h3 style="margin: 0 0 10px 0; color: #064e3b; font-size: 20px; font-weight: bold; display: flex; align-items: center; gap: 8px;">
+            🎉 ¡Entregable Listo y Procesado Exitosamente ({num_workers} Motores)!
+        </h3>
+        <div style="display: flex; gap: 20px; font-size: 15px; flex-wrap: wrap;">
+            <div style="color: #064e3b;"><strong style="color: #064e3b;">SKUs Validados:</strong> <span style="background: #a7f3d0; padding: 2px 8px; border-radius: 4px; color: #064e3b; font-weight: bold;">{len(valid_records)}</span></div>
+            <div style="color: #064e3b;"><strong style="color: #064e3b;">Categorías Detectadas:</strong> <span style="background: #a7f3d0; padding: 2px 8px; border-radius: 4px; color: #064e3b; font-weight: bold;">{final_df['Grupo_Pegado'].nunique() if not final_df.empty else 0}</span></div>
+            <div style="color: #064e3b;"><strong style="color: #064e3b;">Tiempo Total:</strong> <span style="background: #a7f3d0; padding: 2px 8px; border-radius: 4px; color: #064e3b; font-weight: bold;">{fmt_duration(time.monotonic() - t0)}</span></div>
         </div>
     </div>
     """
@@ -319,8 +340,9 @@ def core_engine_distribuido(parsed_skus, duplicates_dict, workers_str, delay_val
 def generate_master_zip(df, progress=gr.Progress()):
     if df is None or df.empty: raise gr.Error("No hay datos para generar el ZIP.")
     ts = int(time.time())
-    zip_filename = f"IMAGENES_LIVERPOOL_V8_7_{ts}.zip"
+    zip_filename = f"IMAGENES_LIVERPOOL_V8_6_{ts}.zip"
     session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     total_rows = len(df)
     with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
         for idx, row in df.iterrows():
@@ -328,24 +350,30 @@ def generate_master_zip(df, progress=gr.Progress()):
             grupo = _coerce_nonempty_str(row.get("Grupo_Pegado", "General"))
             nombre = _coerce_nonempty_str(row.get("Producto_Nombre", "Producto"))
             sku = _coerce_nonempty_str(row.get("Producto", "SKU"))
-            folder_name = f"{re.sub(r'[\\/*?:"<>|]', '', grupo)}/{re.sub(r'[\\/*?:"<>|]', '', nombre)} - {sku}"
+            cl_grupo = re.sub(r'[\\/*?:"<>|]', "", grupo).strip()
+            cl_nombre = re.sub(r'[\\/*?:"<>|]', "", nombre).strip()
+            folder_name = f"{cl_grupo}/{cl_nombre} - {sku}"
             for i in range(1, 7):
                 img_col = f"Image_{i}"
                 if img_col in row and str(row[img_col]).startswith("http"):
+                    url = str(row[img_col])
                     try:
-                        r = session.get(str(row[img_col]), timeout=10)
+                        r = session.get(url, timeout=10)
                         if r.status_code == 200:
-                            zipf.writestr(f"{folder_name}/imagen_{i}.jpg", r.content)
+                            ext = url.split('.')[-1].split('?')[0]
+                            if len(ext) > 4 or not ext: ext = "jpg"
+                            zipf.writestr(f"{folder_name}/imagen_{i}.{ext}", r.content)
                     except: pass
     return gr.update(value=zip_filename, visible=True)
 
 def generate_inline_spinner(pct, done, total, eta_str):
     return f"""
-    <div style="display: flex; align-items: center; justify-content: center; padding: 20px; margin-top: 10px; background: #ffffff; border: 1px dashed #d1d5db; border-radius: 8px;">
+    <div style="display: flex; align-items: center; justify-content: center; padding: 25px; margin-top: 15px; background: #f8fafc; border: 2px dashed #cbd5e1; border-radius: 8px;">
         <div style="display: flex; flex-direction: column; align-items: center;">
-            <div class="loader" style="border: 3px solid #f3f4f6; border-top: 3px solid #111827; border-radius: 50%; width: 35px; height: 35px; animation: spin 1s linear infinite;"></div>
-            <div style="margin-top: 10px; font-size: 14px; font-weight: 700; color: #111827;">Procesando con 10 Motores... {pct}%</div>
-            <div style="font-size: 12px; color: #6b7280; margin-top: 2px;">Extrayendo {done} de {total} productos (ETA: {eta_str})</div>
+            <div class="loader" style="border: 4px solid #e2e8f0; border-top: 4px solid #3b82f6; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite;"></div>
+            <div style="margin-top: 12px; font-size: 15px; font-weight: 800; color: #334155;">Procesando con 10 Motores... {pct}%</div>
+            <div style="font-size: 12px; font-weight: 600; color: #64748b; margin-top: 4px;">Extrayendo {done} de {total} productos</div>
+            <div style="font-size: 11px; font-weight: bold; color: #94a3b8; margin-top: 4px;">Tiempo restante: {eta_str}</div>
         </div>
         <style>@keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}</style>
     </div>
@@ -356,7 +384,7 @@ def build_html_gallery(df: pd.DataFrame, spinner_html: str = "") -> str:
     cols = {c.lower(): c for c in df.columns} if df is not None and not df.empty else {}
     img_cols = [c for i in range(1, 7) for c in [cols.get(f"image_{i}"), cols.get(f"image{i}")] if c]
 
-    html_blocks = ['<div style="display: flex; flex-direction: column; gap: 1rem; padding: 5px;">']
+    html_blocks = ['<div style="display: flex; flex-direction: column; gap: 1.5rem; padding: 10px;">']
 
     if df is not None and not df.empty:
         for _, row in df.iterrows():
@@ -368,22 +396,30 @@ def build_html_gallery(df: pd.DataFrame, spinner_html: str = "") -> str:
             grupo_pegado = _coerce_nonempty_str(row.get(cols.get("grupo_pegado"), "General"))
             estado = _coerce_nonempty_str(row.get(cols.get("estado"), "Disponible"))
             
-            prefix = f"<span style='color: #4338ca; background-color: #e0e7ff; padding: 2px 6px; border-radius: 4px; margin-right: 6px; font-size: 12px;'>[{grupo_pegado}]</span>" if grupo_pegado != "General" else ""
+            prefix = f"<span style='color: #4338ca; background-color: #e0e7ff; padding: 2px 8px; border-radius: 4px; margin-right: 8px;'>[{grupo_pegado}]</span>" if grupo_pegado != "General" else ""
             title = f"{prefix}{name} (SKU: {sku})" if name else f"{prefix}SKU: {sku}"
             
             valid_imgs = [row.get(c, "") for c in img_cols if str(row.get(c, "")).startswith("http")]
             if not valid_imgs: continue
             
-            badge_text = f"{len(valid_imgs)} vistas"
+            badge_text = f"Se encontraron {len(valid_imgs)} imágenes"
             urls_str = "|".join(valid_imgs)
             folder_name_safe = re.sub(r'[\\/*?:"<>|\']', "", f"{grupo_pegado + ' - ' if grupo_pegado != 'General' else ''}{name} - {sku}").replace('"', '').replace("'", "").strip()
             
             actions_html = f"""
-            <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px;">
-                {f'<a href="{url}" target="_blank" style="text-decoration: none; background-color: #f3e8ff; color: #7e22ce; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600;">🛒 Tienda</a>' if url else ''}
-                <a href="#" class="dl-zip-btn" data-folder="{folder_name_safe}" data-urls="{urls_str}" style="text-decoration: none; background-color: #e0f2fe; color: #0284c7; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600;">📥 ZIP Imgs</a>
+            <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px;">
+                {f'<a href="{url}" target="_blank" style="text-decoration: none; background-color: #f3e8ff; color: #7e22ce; padding: 6px 12px; border-radius: 9999px; font-size: 13px; font-weight: bold; border: 1px solid #e9d5ff;">🛒 Ver en tienda</a>' if url else ''}
+                <a href="#" class="dl-zip-btn" data-folder="{folder_name_safe}" data-urls="{urls_str}" style="text-decoration: none; background-color: #e0f2fe; color: #0284c7; padding: 6px 12px; border-radius: 9999px; font-size: 13px; font-weight: bold; border: 1px solid #bae6fd;">📥 Descargar Imágenes</a>
             </div>
             """
+
+            estado_html = f'<span style="background-color: #cffafe; color: #0891b2; padding: 2px 6px; border-radius: 4px; font-weight: 700;">{estado}</span>' if estado.lower() == "preventa" else f'<span style="background-color: #dcfce7; color: #166534; padding: 2px 6px; border-radius: 4px; font-weight: 700;">{estado}</span>'
+            
+            metadata_html = f"""<div style="display: flex; flex-direction: column; gap: 6px; margin-top: 6px; font-size: 13px;">
+                <div style="color: #334155; font-weight: 700;">⚡ Estado: {estado_html}</div>
+                {f'<div style="color: #334155; font-weight: 700;">📂 Categoría web: <span style="color: #0f172a; font-weight: 900;">{categoria}</span></div>' if categoria else ''}
+                {f'<div style="color: #334155; font-weight: 700;">🏷️ Marca: <span style="color: #0f172a; font-weight: 900;">{marca}</span></div>' if marca else ''}
+            </div>"""
 
             p_act_val = float(row.get(cols.get("precio_actual"), 0.0) or 0.0)
             p_orig_val = float(row.get(cols.get("precio_original"), 0.0) or 0.0)
@@ -392,51 +428,93 @@ def build_html_gallery(df: pd.DataFrame, spinner_html: str = "") -> str:
             prices_html = ""
             if p_act_val > 0:
                 if p_orig_val > p_act_val:
-                    prices_html = f"""<div style="border-top: 1px solid #f3f4f6; padding-top: 8px; display: flex; flex-direction: column; gap: 4px; font-size: 12px;">
-                        <div style="display: flex; justify-content: space-between;"><span style="color: #6b7280;">Orig:</span> <span style="text-decoration: line-through; color: #9ca3af;">${p_orig_val:,.2f}</span></div>
-                        <div style="display: flex; justify-content: space-between;"><span style="color: #374151; font-weight: 600;">Actual:</span> <span style="color: #dc2626; font-weight: 700;">${p_act_val:,.2f}</span></div>
+                    prices_html = f"""<div style="margin-top: auto; border-top: 1px solid #e5e7eb; padding-top: 12px; display: flex; flex-direction: column; gap: 6px;">
+                        <div style="display: flex; justify-content: space-between; font-size: 13px;"><span style="color: #6b7280;">Precio Original:</span> <span style="text-decoration: line-through; color: #9ca3af;">${p_orig_val:,.2f}</span></div>
+                        <div style="display: flex; justify-content: space-between; font-size: 14px;"><span style="color: #4b5563; font-weight: 600;">Precio Actual:</span> <span style="color: #e11d48; font-size: 18px; font-weight: 800;">${p_act_val:,.2f}</span></div>
+                        <div style="text-align: right; margin-top: 4px;"><span style="background-color: #fef2f2; color: #dc2626; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; border: 1px solid #fecaca;">-{pct} DESC.</span></div>
                     </div>"""
                 else:
-                    prices_html = f"""<div style="border-top: 1px solid #f3f4f6; padding-top: 8px; display: flex; justify-content: space-between; font-size: 12px;">
-                        <span style="color: #374151; font-weight: 600;">Precio:</span> <span style="color: #111827; font-weight: 700;">${p_act_val:,.2f}</span>
+                    prices_html = f"""<div style="margin-top: auto; border-top: 1px solid #e5e7eb; padding-top: 12px; display: flex; justify-content: space-between; font-size: 14px;">
+                        <span style="color: #4b5563; font-weight: 600;">Precio:</span> <span style="color: #1f2937; font-size: 18px; font-weight: 800;">${p_act_val:,.2f}</span>
                     </div>"""
                 
-            box_html = f"""<div style="display: flex; gap: 15px; flex-wrap: wrap; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; align-items: stretch;">
-                <div style="flex: 3 1 450px;">
-                    <h4 style="margin: 0 0 10px 0; color: #111827; font-size: 14px; font-weight: 600;">📦 {title}</h4>
-                    <div style="display: flex; flex-wrap: wrap; gap: 8px;">"""
-            for img in valid_imgs:
-                box_html += f'<div style="width: 90px; height: 120px; border: 1px solid #f3f4f6; border-radius: 4px; overflow: hidden; display: flex; justify-content: center; align-items: center; background: #fafafa;"><img src="{img}" style="max-width: 100%; max-height: 100%; object-fit: contain;"/></div>'
+            box_html = f"""<div style="display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 8px; align-items: stretch;">
+                <div style="flex: 3 1 500px; border: 1px solid #d1d5db; border-radius: 8px; padding: 16px; background-color: #f8fafc; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                    <h4 style="margin: 0 0 16px 0; color: #4c1d95; font-size: 16px; font-weight: bold;">📦 {title}</h4>
+                    <div style="display: flex; flex-wrap: wrap; gap: 12px;">"""
+            for idx, img in enumerate(valid_imgs):
+                box_html += f'<div style="width: 150px; height: 200px; border: 1px solid #e5e7eb; border-radius: 6px; overflow: hidden; display: flex; justify-content: center; align-items: center; background: #ffffff;"><img src="{img}" style="max-width: 100%; max-height: 100%; object-fit: contain;"/></div>'
             box_html += f"""</div></div>
-                <div style="flex: 1 1 200px; border-left: 1px solid #f3f4f6; padding-left: 12px; display: flex; flex-direction: column; justify-content: space-between;">
-                    <div>{actions_html}<div style="font-size: 12px; color: #4b5563; margin-bottom: 4px;">🏷️ {marca or 'Genérica'}</div><div style="font-size: 12px; color: #4b5563;">⚡ {estado}</div></div>
+                <div style="flex: 1 1 250px; border: 1px solid #d1d5db; border-radius: 8px; padding: 16px; background-color: #f8fafc; box-shadow: 0 1px 3px rgba(0,0,0,0.1); display: flex; flex-direction: column; justify-content: space-between;">
+                    <div>{actions_html}<span style="background-color: #e0e7ff; color: #4338ca; padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: bold; border: 1px solid #c7d2fe;">📸 {badge_text}</span>{metadata_html}</div>
                     {prices_html}
                 </div></div>"""
             html_blocks.append(box_html)
             
-    if spinner_html: html_blocks.append(spinner_html)
+    if spinner_html:
+        html_blocks.append(spinner_html)
+        
     html_blocks.append('</div>')
     return "\n".join(html_blocks)
 
 def generate_duplicates_html(duplicates_dict: dict) -> str:
     if not duplicates_dict: return ""
     count = sum(len(skus) for skus in duplicates_dict.values())
-    return f"""<div style="background: #fefce8; border-left: 4px solid #eab308; padding: 12px; border-radius: 6px; margin-bottom: 12px; font-size: 13px;">
-        <strong style="color: #854d0e;">⚠️ Productos Repetidos / Omitidos ({count})</strong></div>"""
+    
+    lines_html = ""
+    for g, skus in duplicates_dict.items():
+        g_name = g if str(g).strip() and str(g)!='General' else 'Sin Categoría'
+        lines_html += f'<div style="color: #854d0e;"><strong style="color: #854d0e;">[{g_name}]:</strong> {", ".join(skus)}</div>'
+        
+    return f"""
+    <div style="background: linear-gradient(to right, #fefce8, #fef9c3); border-left: 6px solid #eab308; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px;">
+        <h3 style="margin: 0 0 8px 0; color: #854d0e; font-size: 18px; font-weight: bold; display: flex; align-items: center; gap: 8px;">
+            ⚠️ PRODUCTOS REPETIDOS / Omitidos: {count}
+        </h3>
+        <p style="margin: 0 0 12px 0; color: #a16207; font-size: 14px;">
+            Estos SKUs ya estaban en la lista y fueron omitidos para evitar duplicados en el entregable:
+        </p>
+        <div style="display: flex; flex-direction: column; gap: 6px; font-size: 14px;">
+            {lines_html}
+        </div>
+    </div>
+    """
 
 def generate_offline_html(offline_dict: dict) -> str:
     if not offline_dict: return ""
     count = sum(len(skus) for skus in offline_dict.values())
-    return f"""<div style="background: #fef2f2; border-left: 4px solid #ef4444; padding: 12px; border-radius: 6px; margin-bottom: 12px; font-size: 13px;">
-        <strong style="color: #7f1d1d;">⚠️ Productos Descatalogados / Off ({count})</strong></div>"""
+    
+    lines_html = ""
+    for g, skus in offline_dict.items():
+        g_name = g if str(g).strip() and str(g)!='General' else 'Sin Categoría'
+        lines_html += f'<div style="color: #7f1d1d;"><strong style="color: #7f1d1d;">[{g_name}]:</strong> {", ".join(skus)}</div>'
+        
+    return f"""
+    <div style="background: linear-gradient(to right, #fef2f2, #fee2e2); border-left: 6px solid #ef4444; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px;">
+        <h3 style="margin: 0 0 8px 0; color: #7f1d1d; font-size: 18px; font-weight: bold; display: flex; align-items: center; gap: 8px;">
+            ⚠️ PRODUCTOS OFF / Descatalogados: {count}
+        </h3>
+        <p style="margin: 0 0 12px 0; color: #991b1b; font-size: 14px;">
+            Estos SKUs no arrojaron resultados y <strong style="color: #7f1d1d;">NO se agregaron al CSV</strong>:
+        </p>
+        <div style="display: flex; flex-direction: column; gap: 6px; font-size: 14px;">
+            {lines_html}
+        </div>
+    </div>
+    """
 
-def _preview_with_toggles(full_df, show_url, show_name, show_strategy):
-    cols = ["ID", "Grupo_Pegado", "Producto", "Categoria", "Marca", "Estado", "Precio_Actual", "Precio_Original", "Descuento_Porcentaje"]
+def _preview_with_toggles(full_df: pd.DataFrame, show_url: bool, show_name: bool, show_strategy: bool) -> pd.DataFrame:
+    cols = ["ID", "Grupo_Pegado", "Producto", "Categoria", "Marca", "Estado", "Precio_Actual", "Precio_Original", "Descuento_Porcentaje", "Image_1", "Image_2", "Image_3", "Image_4", "Image_5", "Image_6"]
+    if show_url: cols.append("producto_url")
+    if show_name: cols.append("Producto_Nombre")
+    if show_strategy: cols.append("Estrategia")
     return full_df.loc[:, [c for c in cols if c in full_df.columns]]
 
-def _write_csvs(full_df, prefix):
+def _write_csvs(full_df: pd.DataFrame, prefix: str) -> str:
+    csv_cols = ["ID", "Grupo_Pegado", "Producto", "Categoria", "Marca", "Estado", "Precio_Actual", "Precio_Original", "Descuento_Porcentaje", "Image_1", "Image_2", "Image_3", "Image_4", "Image_5", "Image_6"]
+    df_export = full_df.loc[:, [c for c in csv_cols if c in full_df.columns]] if not full_df.empty else pd.DataFrame(columns=csv_cols)
     fp = f"{prefix}_FEED_{int(time.time())}.csv"
-    full_df.to_csv(fp, index=False, encoding="utf-8")
+    df_export.to_csv(fp, index=False, encoding="utf-8")
     return fp
 
 HEAD_JS = """
@@ -450,9 +528,10 @@ document.addEventListener('click', async function(e) {
     }
     if (!btn) return;
     e.preventDefault();
-    if (typeof window.JSZip === 'undefined') { alert("Cargando librería ZIP..."); return; }
+    if (typeof window.JSZip === 'undefined') { alert("Las librerías del ZIP aún están cargando. Intenta de nuevo en 1 segundo."); return; }
     const originalText = btn.innerHTML;
     btn.innerHTML = "⏳ Descargando...";
+    btn.style.pointerEvents = "none"; btn.style.opacity = "0.7";
     try {
         const urls = btn.getAttribute('data-urls').split('|').filter(u => u.trim() !== '');
         const folderName = btn.getAttribute('data-folder');
@@ -460,99 +539,81 @@ document.addEventListener('click', async function(e) {
         let downloaded = 0;
         for(let i=0; i<urls.length; i++) {
             let url = urls[i], blob = null;
-            try { let resp = await fetch(url); if (resp.ok) blob = await resp.blob(); } catch(err) {}
-            if (blob) { folder.file("imagen_" + (i+1) + ".jpg", blob); downloaded++; }
+            try { let resp = await fetch(url); if (!resp.ok) throw new Error("Status"); blob = await resp.blob(); }
+            catch(err) { try { let resp = await fetch('https://corsproxy.io/?' + encodeURIComponent(url)); if (resp.ok) blob = await resp.blob(); } catch(err2) { } }
+            if (blob) { let ext = url.split('.').pop().split('?')[0]; folder.file("imagen_" + (i+1) + "." + (ext.length > 4 || !ext ? 'jpg' : ext), blob); downloaded++; }
         }
-        if (downloaded > 0) {
+        if (downloaded === 0 && urls.length > 0) alert("No se pudo descargar ninguna imagen por bloqueos del navegador.\\n\\nSolución: Usa el botón '📦 Generar ZIP' superior.");
+        else {
             const content = await zip.generateAsync({type:"blob"});
             const link = document.createElement('a'); link.href = URL.createObjectURL(content);
             link.download = folderName + ".zip"; document.body.appendChild(link); link.click();
-            document.body.removeChild(link);
+            document.body.removeChild(link); setTimeout(() => URL.revokeObjectURL(link.href), 2000);
         }
-    } catch(err) {}
-    btn.innerHTML = originalText;
+    } catch(err) { alert("Ocurrió un error al crear el archivo ZIP."); }
+    btn.innerHTML = originalText; btn.style.pointerEvents = "auto"; btn.style.opacity = "1";
 });
 </script>
 """
 
-# ====================== Interfaz de Usuario (E-commerce Minimalista) ======================
+# ====================== Interfaz de Usuario ======================
 
-THEME = gr.themes.Default(
-    primary_hue="neutral",
-    secondary_hue="neutral",
-    neutral_hue="slate",
-).set(
-    body_background_fill="#f9fafb",
-    block_background_fill="#ffffff",
-    block_border_color="#e5e7eb",
-    block_radius="8px",
-    button_primary_background_fill="#111827",
-    button_primary_background_fill_hover="#1f2937",
-    button_primary_text_color="#ffffff",
-)
+try: THEME = gr.themes.Soft(primary_hue="fuchsia", secondary_hue="violet", neutral_hue="slate")
+except: THEME = gr.themes.Soft()
+CUSTOM_CSS = ".download-row .wrap { gap: 8px !important; align-items: center; }"
 
-CUSTOM_CSS = """
-body { background-color: #f9fafb; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-.gradio-container { max-width: 1400px !important; margin: auto; padding: 20px; }
-h3, h4 { color: #111827 !important; font-weight: 700 !important; }
-.gr-button-primary { background-color: #111827 !important; color: #ffffff !important; border-radius: 6px !important; font-weight: 600 !important; }
-.gr-button-secondary { background-color: #f3f4f6 !important; color: #374151 !important; border: 1px solid #d1d5db !important; border-radius: 6px !important; }
-.download-row .wrap { gap: 10px !important; align-items: center; }
-.card-ecommerce { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
-"""
-
-with gr.Blocks(theme=THEME, css=CUSTOM_CSS, head=HEAD_JS, title="Liverpool Catalog Manager – Pro") as demo:
+with gr.Blocks(title="V8.7 – Generador de Entregable Distribuido") as demo:
     df_state = gr.State()
     
-    with gr.Row(elem_classes=["card-ecommerce"]):
-        with gr.Column():
-            gr.Markdown("## 🛍️ Liverpool Catalog & Assets Manager (Distribuido 10 Motores)")
-            gr.Markdown("<p style='color: #6b7280; margin: 0; font-size: 13px;'>Panel de control optimizado para extracción masiva de productos e imágenes.</p>")
+    gr.Markdown("### V8.7 – Tarjetas Inteligentes (Éxito, Repetidos, Descatalogados) + 10 Motores en Paralelo")
 
-    with gr.Row():
-        # COLUMNA IZQUIERDA: Controles
-        with gr.Column(scale=1):
-            with gr.Tabs():
-                with gr.TabItem("📝 Carga Manual"):
-                    skus_in = gr.Textbox(lines=5, label="Categoría + SKUs", placeholder="Zapatos\t12501544\t14152211")
-                    btn_proc_paste = gr.Button("⚙️ Procesar Lote Manual", variant="primary", size="lg")
-                    
-                with gr.TabItem("🔍 Catálogo Web"):
-                    cat_n1 = gr.Dropdown(label="Principal", choices=list(CATALOGO_LIVERPOOL.keys()), value="Mujer")
-                    cat_n2 = gr.Dropdown(label="Subcategoría 1", choices=list(CATALOGO_LIVERPOOL["Mujer"].keys()))
-                    cat_n3 = gr.Dropdown(label="Subcategoría 2", choices=list(CATALOGO_LIVERPOOL["Mujer"].get("Ropa", {}).keys()))
-                    limit_destacados = gr.Number(label="Límite de productos", value=50, precision=0, minimum=1, maximum=200)
-                    btn_proc_cat = gr.Button("🚀 Extraer Destacados", variant="primary", size="lg")
-
-            with gr.Accordion("⚙️ Ajustes de Motores (Avanzado)", open=False):
-                workers_input = gr.Textbox(label="URLs de los 10 Motores", value=DEFAULT_WORKERS, lines=3)
-                with gr.Row():
-                    delay_global = gr.Slider(0.0, 2.0, value=0.0, step=0.1, label="Delay (seg)")
-                    google_global = gr.Checkbox(value=True, label="Google Search")
-                with gr.Row():
-                    show_url_global = gr.Checkbox(value=True, label="Ver URL")
-                    show_name_global = gr.Checkbox(value=True, label="Ver Nombre")
-                    show_strat_global = gr.Checkbox(value=False, label="Ver Estrategia")
-
-            with gr.Column(elem_classes=["download-row"], visible=False) as export_panel:
-                gr.Markdown("### 📥 Exportar Resultados")
-                download_feed_shared = gr.DownloadButton("⬇️ Descargar Feed CSV", variant="primary", visible=False)
-                btn_master_zip = gr.Button("📦 Generar ZIP de Imágenes", variant="secondary")
-                download_master_zip = gr.DownloadButton("⬇️ Descargar ZIP Maestro", variant="primary", visible=False)
-
-        # COLUMNA DERECHA: Resultados
-        with gr.Column(scale=2):
-            out_stats_shared = gr.HTML(visible=False) 
-            out_duplicates_shared = gr.HTML(visible=False) 
-            out_broken_md_shared = gr.HTML(visible=False) 
-
-            gr.Markdown("### 🖼️ Galería en Tiempo Real")
-            out_gallery_shared = gr.HTML(label="Galería")
+    with gr.Tabs():
+        with gr.TabItem("📝 Pegar SKUs / Excel"):
+            skus_in = gr.Textbox(lines=5, label="Pega tu tabla (Categoría + SKUs mezclados)", placeholder="Zapatos\t12501544\t14152211")
+            btn_proc_paste = gr.Button("⚙️ Procesar Tabla Manual (10 Motores)", variant="primary")
             
-            with gr.Accordion("📊 Tabla de Datos (Feed)", open=False):
-                out_preview_shared = gr.Dataframe(interactive=False, wrap=True, label="Data Feed")
+        with gr.TabItem("🔍 Extraer Destacados (Automático)"):
+            gr.Markdown("Selecciona la categoría para extraer los productos destacados directamente de la tienda.")
+            with gr.Row():
+                cat_n1 = gr.Dropdown(label="Categoría Principal", choices=list(CATALOGO_LIVERPOOL.keys()), value="Mujer")
+                cat_n2 = gr.Dropdown(label="Subcategoría 1", choices=list(CATALOGO_LIVERPOOL["Mujer"].keys()))
+                cat_n3 = gr.Dropdown(label="Subcategoría 2", choices=list(CATALOGO_LIVERPOOL["Mujer"].get("Ropa", {}).keys()))
+            
+            limit_destacados = gr.Number(label="Cantidad máxima a extraer", value=50, precision=0, minimum=1, maximum=200)
+            btn_proc_cat = gr.Button("🚀 Extraer y Procesar Destacados (10 Motores)", variant="primary")
 
-    notif_audio = gr.Audio(label="Notificación", autoplay=True, interactive=False, visible=False)
+    with gr.Accordion("⚙️ Ajustes de Procesamiento (Avanzado)", open=False):
+        workers_input = gr.Textbox(
+            label="URLs de los 10 Motores (separadas por coma)", 
+            value=DEFAULT_WORKERS,
+            lines=2
+        )
+        with gr.Row():
+            delay_global = gr.Slider(0.0, 2.0, value=0.0, step=0.1, label="Delay entre oleadas de 10 (seg)")
+            google_global = gr.Checkbox(value=True, label="Usar Google (más preciso)")
+        with gr.Row():
+            show_url_global = gr.Checkbox(value=True, label="Mostrar producto_url (vista previa)")
+            show_name_global = gr.Checkbox(value=True, label="Mostrar Producto_Nombre (vista previa)")
+            show_strat_global = gr.Checkbox(value=False, label="Mostrar Estrategia (vista previa)")
+
+    gr.Markdown("---")
+    
+    out_stats_shared = gr.HTML(visible=False) 
+    out_duplicates_shared = gr.HTML(visible=False) 
+    out_broken_md_shared = gr.HTML(visible=False) 
+
+    with gr.Column(elem_classes=["download-row"]):
+        with gr.Row():
+            download_feed_shared = gr.DownloadButton("⬇️ DESCARGAR CSV FEED", visible=False, variant="primary")
+            btn_master_zip = gr.Button("📦 Generar ZIP de Imágenes", visible=False, variant="secondary")
+            download_master_zip = gr.DownloadButton("⬇️ DESCARGAR ZIP MAESTRO", visible=False, variant="primary")
+    
+    gr.Markdown("---")
+    gr.Markdown("### 🖼️ Preview de imágenes y Datos")
+    out_gallery_shared = gr.HTML(label="Preview de imágenes")
+    gr.Markdown("### 📊 Vista previa entregable")
+    out_preview_shared = gr.Dataframe(interactive=False, wrap=True, label="Vista previa entregable")
+    notif_audio = gr.Audio(label="🔔 Notificación", autoplay=True, interactive=False, visible=False)
 
     def update_n2(n1):
         if not n1: return gr.update(choices=[], value=None)
@@ -572,39 +633,50 @@ with gr.Blocks(theme=THEME, css=CUSTOM_CSS, head=HEAD_JS, title="Liverpool Catal
         parsed, duplicates = parse_grouped_skus(skus_text)
         if not parsed: raise gr.Error("No se encontraron SKUs válidos.")
         for step in core_engine_distribuido(parsed, duplicates, workers_url, delay, use_g, s_url, s_name, s_strat, "MANUAL"):
-            if len(step) == 7: yield (*step, gr.update(visible=True))
-            else: yield step
+            if len(step) == 7:
+                yield (*step, gr.update(visible=False))
+            else:
+                yield step
 
     def handler_extract(n1, n2, n3, limit, workers_url, delay, use_g, s_url, s_name, s_strat):
-        if not n1 or not n2 or not n3: raise gr.Error("Selecciona la jerarquía completa.")
+        if not n1 or not n2 or not n3: raise gr.Error("Selecciona la jerarquía completa de categorías.")
         url = CATALOGO_LIVERPOOL.get(n1, {}).get(n2, {}).get(n3, "")
-        if not url: raise gr.Error("URL no encontrada.")
+        if not url: raise gr.Error("No se encontró la URL en el catálogo.")
         
         yield (gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(value=""), gr.update(value=pd.DataFrame()), gr.update(), gr.update(value=None, visible=False), gr.update(visible=False))
         
         skus = extraer_skus_de_categoria_maestro(url, limit=int(limit))
-        if not skus: raise gr.Error("Categoría vacía.")
+        if not skus: raise gr.Error("No se lograron extraer productos. La categoría podría estar vacía.")
         
-        parsed = [(f"{n1} - {n3}", sku) for sku in skus]
+        grupo_nombre = f"{n1} - {n3}"
+        parsed = [(grupo_nombre, sku) for sku in skus]
         for step in core_engine_distribuido(parsed, {}, workers_url, delay, use_g, s_url, s_name, s_strat, "DESTACADOS"):
-            if len(step) == 7: yield (*step, gr.update(visible=True))
-            else: yield step
+            if len(step) == 7:
+                yield (*step, gr.update(visible=False))
+            else:
+                yield step
 
     btn_proc_paste.click(
         fn=handler_paste,
         inputs=[skus_in, workers_input, delay_global, google_global, show_url_global, show_name_global, show_strat_global],
         outputs=[out_stats_shared, out_duplicates_shared, out_broken_md_shared, out_gallery_shared, out_preview_shared, df_state, notif_audio, download_feed_shared],
         show_progress="hidden"
-    ).then(fn=lambda: gr.update(visible=True), outputs=[export_panel])
+    ).then(
+        fn=lambda: gr.update(visible=True), 
+        outputs=[btn_master_zip]
+    )
 
     btn_proc_cat.click(
         fn=handler_extract,
         inputs=[cat_n1, cat_n2, cat_n3, limit_destacados, workers_input, delay_global, google_global, show_url_global, show_name_global, show_strat_global],
         outputs=[out_stats_shared, out_duplicates_shared, out_broken_md_shared, out_gallery_shared, out_preview_shared, df_state, notif_audio, download_feed_shared],
         show_progress="hidden"
-    ).then(fn=lambda: gr.update(visible=True), outputs=[export_panel])
+    ).then(
+        fn=lambda: gr.update(visible=True), 
+        outputs=[btn_master_zip]
+    )
 
-    def pre_zip_ui(): return gr.update(value="⏳ Empacando...", interactive=False)
+    def pre_zip_ui(): return gr.update(value="⏳ ✨ Empacando imágenes...", interactive=False)
     def post_zip_ui(): return gr.update(value="📦 Generar ZIP de Imágenes", interactive=True)
 
     btn_master_zip.click(fn=pre_zip_ui, inputs=[], outputs=[btn_master_zip]).then(
@@ -613,4 +685,10 @@ with gr.Blocks(theme=THEME, css=CUSTOM_CSS, head=HEAD_JS, title="Liverpool Catal
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+    demo.launch(
+        server_name="0.0.0.0", 
+        server_port=port, 
+        theme=THEME, 
+        css=CUSTOM_CSS, 
+        head=HEAD_JS
+    )
