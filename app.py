@@ -1,4 +1,4 @@
-# app.py – V8.7 Maestro (Procesamiento Distribuido Round-Robin)
+# app.py – V8.7 Maestro Distribuido (Round-Robin)
 import os
 import re
 import time
@@ -78,7 +78,6 @@ def consultar_worker(worker_url: str, chunk_skus: list[tuple[str, str]], usar_go
     """Envía un lote de SKUs asignados a un Motor específico vía POST"""
     try:
         url = worker_url.strip().rstrip("/") + "/procesar_lote"
-        # Serializamos las tuplas en formato compatible con JSON
         payload = {"skus": chunk_skus, "usar_google": usar_google}
         resp = requests.post(url, json=payload, timeout=DEFAULT_TIMEOUT)
         if resp.status_code == 200:
@@ -97,7 +96,6 @@ def procesar_distribuido(parsed_skus, workers_str, usar_google_val, delay_val, s
         gr.update(value=pd.DataFrame()), gr.update(), gr.update(value=None, visible=False)
     )
 
-    # Obtener URLs de workers válidas
     workers = [w.strip() for w in workers_str.split(",") if w.strip()]
     if not workers:
         workers = ["http://localhost:7860"]
@@ -112,7 +110,6 @@ def procesar_distribuido(parsed_skus, workers_str, usar_google_val, delay_val, s
     offline_dict = {}
     t0 = time.monotonic()
 
-    # Lanzar peticiones en paralelo a los Workers con sus respectivos buckets
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(workers)) as executor:
         future_to_worker = {
             executor.submit(consultar_worker, workers[i], worker_buckets[i], usar_google_val): i 
@@ -120,7 +117,6 @@ def procesar_distribuido(parsed_skus, workers_str, usar_google_val, delay_val, s
         }
 
         done_count = 0
-        # Mapeo temporal para ordenar resultados al terminar
         all_results_map = {}
 
         for future in concurrent.futures.as_completed(future_to_worker):
@@ -137,13 +133,12 @@ def procesar_distribuido(parsed_skus, workers_str, usar_google_val, delay_val, s
                 for s in skus_list:
                     if s not in offline_dict[grupo]: offline_dict[grupo].append(s)
 
-        # Reconstruir la lista final respetando estrictamente el orden original del usuario
+        # Reconstruir la lista final respetando estrictamente el orden original
         ordered_valid_records = []
         for _, sku in parsed_skus:
             if sku in all_results_map:
                 ordered_valid_records.append(all_results_map[sku])
 
-        # Asignar IDs limpios consecutivos
         for i, rec in enumerate(ordered_valid_records):
             rec["ID"] = i + 1
 
@@ -161,7 +156,6 @@ def procesar_distribuido(parsed_skus, workers_str, usar_google_val, delay_val, s
             gr.update(value=None, visible=False)
         )
 
-    # FINALIZACIÓN
     final_df = pd.DataFrame(ordered_valid_records)
     _write_csvs(final_df, f"{prefix}_V8_7")
     
@@ -216,7 +210,7 @@ def generate_inline_spinner(pct, done, total, eta_str):
     <div style="display: flex; align-items: center; justify-content: center; padding: 25px; margin-top: 15px; background: #f8fafc; border: 2px dashed #cbd5e1; border-radius: 8px;">
         <div style="display: flex; flex-direction: column; align-items: center;">
             <div class="loader" style="border: 4px solid #e2e8f0; border-top: 4px solid #3b82f6; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite;"></div>
-            <div style="margin-top: 12px; font-size: 15px; font-weight: 800; color: #334155;">Procesamiento Distribuido Round-Robin... {pct}%</div>
+            <div style="margin-top: 12px; font-size: 15px; font-weight: 800; color: #334155;">Procesando Distribuido Round-Robin... {pct}%</div>
             <div style="font-size: 12px; font-weight: 600; color: #64748b; margin-top: 4px;">Procesados {done} de {total} productos en paralelo</div>
         </div>
         <style>@keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}</style>
@@ -266,6 +260,10 @@ def _write_csvs(full_df, prefix):
 HEAD_JS = "<script src='https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js'></script>"
 
 # ====================== Interfaz Gradio Maestro ======================
+try: THEME = gr.themes.Soft(primary_hue="fuchsia", secondary_hue="violet", neutral_hue="slate")
+except: THEME = gr.themes.Soft()
+CUSTOM_CSS = ".download-row .wrap { gap: 8px !important; align-items: center; }"
+
 with gr.Blocks(title="Maestro Distribuido Liverpool") as demo:
     df_state = gr.State()
     gr.Markdown("### 🧠 V8.7 – Cerebro Maestro (Procesamiento Distribuido Round-Robin)")
@@ -296,7 +294,7 @@ with gr.Blocks(title="Maestro Distribuido Liverpool") as demo:
     with gr.Row():
         download_feed_shared = gr.DownloadButton("⬇️ DESCARGAR CSV", visible=False, variant="primary")
         btn_master_zip = gr.Button("📦 Generar ZIP", visible=False, variant="secondary")
-        download_master_zip = gr.DownloadButton("⬇️️ DESCARGAR ZIP", visible=False, variant="primary")
+        download_master_zip = gr.DownloadButton("⬇️ DESCARGAR ZIP", visible=False, variant="primary")
 
     out_gallery_shared = gr.HTML(label="Preview")
     out_preview_shared = gr.Dataframe(interactive=False)
@@ -320,4 +318,10 @@ with gr.Blocks(title="Maestro Distribuido Liverpool") as demo:
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port, head=HEAD_JS)
+    demo.launch(
+        server_name="0.0.0.0", 
+        server_port=port, 
+        theme=THEME, 
+        css=CUSTOM_CSS, 
+        head=HEAD_JS
+    )
